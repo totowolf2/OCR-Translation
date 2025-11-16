@@ -92,6 +92,8 @@ class OcrTranslatorApp:
         self.watch_mode_active = False
         self.history_reset_interval = 60.0  # seconds of inactivity before clearing history
         self.last_history_timestamp = None
+        self.overlay_auto_hide_seconds = 10.0
+        self.overlay_hide_job = None
 
         # ---- Saved position state ----
         self.saved_watch_bbox = None
@@ -272,7 +274,6 @@ class OcrTranslatorApp:
         self.watch_bbox = tuple(self.saved_watch_bbox)
         self.overlay_bbox = tuple(self.saved_overlay_bbox)
         self._create_overlay_window()
-        self._update_overlay_text("รอข้อความจาก watch ...")
         self._reset_translation_history()
         self._start_watch_after_selection(self.watch_bbox)
 
@@ -316,7 +317,6 @@ class OcrTranslatorApp:
         self.overlay_bbox = bbox
         self._save_watch_positions()
         self._create_overlay_window()
-        self._update_overlay_text("รอข้อความจาก watch ...")
         self._start_watch_after_selection(self.watch_bbox)
 
     def _on_hotkey_stop_watch(self):
@@ -647,9 +647,14 @@ class OcrTranslatorApp:
             wraplength=wrap_len,
         )
         self.overlay_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self._hide_overlay()  # start hidden until we see the first text
 
     def _destroy_overlay_window(self):
         """Destroy overlay window if it exists."""
+        if self.overlay_hide_job is not None:
+            self.root.after_cancel(self.overlay_hide_job)
+            self.overlay_hide_job = None
+
         if self.overlay_window is not None:
             self.overlay_window.destroy()
 
@@ -666,6 +671,39 @@ class OcrTranslatorApp:
             text=text_th,
             font=("Leelawadee UI", font_size, "bold"),
         )
+        self._show_overlay()
+        self._schedule_overlay_auto_hide()
+
+    def _show_overlay(self):
+        """Bring overlay window back on screen."""
+        if self.overlay_window is None:
+            return
+
+        self.overlay_window.deiconify()
+        self.overlay_window.lift()
+        self.overlay_window.attributes("-topmost", True)
+
+    def _hide_overlay(self):
+        """Hide overlay window temporarily."""
+        if self.overlay_window is None:
+            return
+
+        if self.overlay_hide_job is not None:
+            self.root.after_cancel(self.overlay_hide_job)
+            self.overlay_hide_job = None
+
+        self.overlay_window.withdraw()
+
+    def _schedule_overlay_auto_hide(self):
+        """Hide overlay if no new text arrives within timeout."""
+        if self.overlay_window is None:
+            return
+
+        if self.overlay_hide_job is not None:
+            self.root.after_cancel(self.overlay_hide_job)
+
+        delay_ms = int(self.overlay_auto_hide_seconds * 1000)
+        self.overlay_hide_job = self.root.after(delay_ms, self._hide_overlay)
 
     # ------------------------------------------------------------------
     # Close / main loop
