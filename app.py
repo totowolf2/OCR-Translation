@@ -10,7 +10,7 @@ from PIL import ImageGrab
 import pytesseract
 from deep_translator import GoogleTranslator
 import keyboard
-from pytesseract import TesseractNotFoundError
+from pytesseract import Output, TesseractNotFoundError
 
 # ------------------ Logging Setup ------------------
 logging.basicConfig(
@@ -26,6 +26,7 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 
 APP_DIR = Path(__file__).resolve().parent
 POSITIONS_PATH = APP_DIR / "watch_positions.json"
+TRANSPARENT_COLOR = "#1f1407"
 
 
 class OcrTranslatorApp:
@@ -94,6 +95,12 @@ class OcrTranslatorApp:
         self.last_history_timestamp = None
         self.overlay_auto_hide_seconds = 10.0
         self.overlay_hide_job = None
+        self.screen_mode_active = False
+        self.screen_mode_bbox = None
+        self.screen_mode_thread = None
+        self.screen_mode_stop_event = threading.Event()
+        self.screen_overlay_windows = []
+        self.screen_last_entries = {}
 
         # ---- Saved position state ----
         self.saved_watch_bbox = None
@@ -113,7 +120,12 @@ class OcrTranslatorApp:
         """Create UI: left (OCR) and right (translation) text boxes with adjustable splitter."""
         hotkey_label = tk.Label(
             self.root,
-            text="Hotkeys: Ctrl+Shift+Q = แปลครั้งเดียว | Ctrl+Shift+W = เฝ้าพื้นที่ | Ctrl+Shift+E = หยุดเฝ้า",
+            text=(
+                "Hotkeys: Ctrl+Shift+Q = แปลครั้งเดียว | "
+                "Ctrl+Shift+W = เฝ้าพื้นที่ | "
+                "Ctrl+Shift+R = แปลทั้งหน้าจอ | "
+                "Ctrl+Shift+E = หยุด"
+            ),
             bg="#f5f5f5",
             fg="#333333",
         )
@@ -200,8 +212,9 @@ class OcrTranslatorApp:
         """Register global hotkeys for capture and watch."""
         keyboard.add_hotkey("ctrl+shift+q", self._on_hotkey_single)
         keyboard.add_hotkey("ctrl+shift+w", self._on_hotkey_watch)
+        keyboard.add_hotkey("ctrl+shift+r", self._on_hotkey_screen_mode)
         keyboard.add_hotkey("ctrl+shift+e", self._on_hotkey_stop_watch)
-        logger.info("Hotkeys registered: Q(single), W(watch), E(stop watch)")
+        logger.info("Hotkeys registered: Q(single), W(watch), R(screen), E(stop)")
 
     def _load_saved_positions(self):
         """Load saved watch/overlay positions from disk."""
@@ -271,6 +284,7 @@ class OcrTranslatorApp:
             return
 
         self._stop_watch()
+        self._stop_screen_mode()
         self.watch_bbox = tuple(self.saved_watch_bbox)
         self.overlay_bbox = tuple(self.saved_overlay_bbox)
         self._create_overlay_window()
@@ -288,9 +302,15 @@ class OcrTranslatorApp:
         logger.info("Hotkey watch pressed")
         self.root.after(0, self._start_watch_workflow)
 
+    def _on_hotkey_screen_mode(self):
+        """Start selection for full-screen overlay translation."""
+        logger.info("Hotkey screen mode pressed")
+        self.root.after(0, self._start_screen_mode_selection)
+
     def _start_watch_workflow(self):
         """Two-step selection: watch area then overlay display area."""
         self._stop_watch()
+        self._stop_screen_mode()
         self.watch_bbox = None
         self.overlay_bbox = None
         self._reset_translation_history()
@@ -319,10 +339,46 @@ class OcrTranslatorApp:
         self._create_overlay_window()
         self._start_watch_after_selection(self.watch_bbox)
 
+    def _start_screen_mode_selection(self):
+        """Prompt user to drag a region/monitor for screen translation mode."""
+        self._stop_screen_mode()
+        self._stop_watch()
+        self.screen_mode_bbox = None
+        self._update_original_text("")
+        self._reset_translation_history()
+        self.screen_last_entries = {}
+        self.after_selection_action = self._start_screen_mode_after_selection
+        self._update_translation_text("เลือกหน้าจอหรือพื้นที่ที่ต้องการแปลทั้งจอ")
+        self._start_region_selection()
+
+    def _start_screen_mode_after_selection(self, bbox):
+        """Begin the continuous full-screen translation loop."""
+        logger.info("Screen mode bbox selected: %s", bbox)
+        self.after_selection_action = None
+        self.screen_mode_bbox = bbox
+        self._start_screen_mode()
+
+    def _start_screen_mode(self):
+        """Launch screen translation thread."""
+        if self.screen_mode_bbox is None:
+            return
+
+        bbox = self.screen_mode_bbox
+        self._stop_screen_mode(clear_bbox=False)
+        self.screen_mode_bbox = bbox
+        self.screen_mode_stop_event = threading.Event()
+        self.screen_mode_active = True
+        self.screen_mode_thread = threading.Thread(
+            target=self._screen_mode_loop,
+            daemon=True,
+        )
+        self.screen_mode_thread.start()
+
     def _on_hotkey_stop_watch(self):
         """Stop watch mode."""
         logger.info("Hotkey stop watch pressed")
         self._stop_watch()
+        self._stop_screen_mode()
 
     # ------------------------------------------------------------------
     # Screen region selection
@@ -532,6 +588,223 @@ class OcrTranslatorApp:
         self.last_history_timestamp = now
 
     # ------------------------------------------------------------------
+    # Screen translation mode helpers
+    # ------------------------------------------------------------------
+    def _stop_screen_mode(self, clear_bbox=True):
+        """Stop the full-screen translation loop and clear overlays."""
+        if self.screen_mode_thread is not None:
+            logger.info("Stopping screen translation mode...")
+            self.screen_mode_stop_event.set()
+            self.screen_mode_thread = None
+
+        self.screen_mode_active = False
+        if clear_bbox:
+            self.screen_mode_bbox = None
+        self.screen_last_entries = {}
+        self.root.after(0, self._destroy_screen_overlay_windows)
+
+    def _screen_mode_loop(self):
+        """Continuously scan the selected screen area and overlay translations."""
+        if self.screen_mode_bbox is None:
+            return
+
+        bbox = self.screen_mode_bbox
+        translator = GoogleTranslator(source="en", target="th")
+        interval_sec = 2.0
+
+        logger.info("Screen translation loop started.")
+        while not self.screen_mode_stop_event.is_set():
+            try:
+                image = ImageGrab.grab(bbox=bbox)
+                data = pytesseract.image_to_data(
+                    image, lang="eng", output_type=Output.DICT
+                )
+                lines = self._collect_screen_lines(data, bbox[0], bbox[1])
+
+                overlays = []
+                new_cache = {}
+                for entry in lines:
+                    text_en = entry["text"].strip()
+                    if not text_en or not self._looks_like_english(text_en):
+                        continue
+
+                    key = (
+                        round(entry["x"]),
+                        round(entry["y"]),
+                        round(entry["w"]),
+                        round(entry["h"]),
+                    )
+                    cached = self.screen_last_entries.get(key)
+                    if cached and cached["text_en"] == text_en:
+                        text_th = cached["text_th"]
+                        new_cache[key] = cached
+                    else:
+                        text_th = translator.translate(text_en).strip()
+                        if text_th:
+                            new_cache[key] = {
+                                "text_en": text_en,
+                                "text_th": text_th,
+                            }
+
+                    if not text_th:
+                        continue
+
+                    overlays.append(
+                        {
+                            "text": text_th,
+                            "x": entry["x"],
+                            "y": entry["y"] + entry["h"] + 2,
+                            "w": entry["w"],
+                        }
+                    )
+
+                self.screen_last_entries = new_cache
+
+                self.root.after(0, self._render_screen_mode_overlays, overlays)
+
+            except Exception as exc:
+                logger.exception("Screen mode error: %s", exc)
+
+            self.screen_mode_stop_event.wait(interval_sec)
+
+        self.root.after(0, self._destroy_screen_overlay_windows)
+        logger.info("Screen translation loop stopped.")
+
+    def _collect_screen_lines(self, data, offset_x, offset_y):
+        """Group OCR words into full lines for translation."""
+        lines = {}
+        n = len(data.get("text", []))
+
+        for i in range(n):
+            text = data["text"][i].strip()
+            if not text:
+                continue
+
+            key = (
+                data["block_num"][i],
+                data["par_num"][i],
+                data["line_num"][i],
+            )
+
+            entry = lines.setdefault(
+                key,
+                {
+                    "words": [],
+                    "x1": data["left"][i],
+                    "y1": data["top"][i],
+                    "x2": data["left"][i] + data["width"][i],
+                    "y2": data["top"][i] + data["height"][i],
+                },
+            )
+
+            entry["words"].append(text)
+            entry["x1"] = min(entry["x1"], data["left"][i])
+            entry["y1"] = min(entry["y1"], data["top"][i])
+            entry["x2"] = max(entry["x2"], data["left"][i] + data["width"][i])
+            entry["y2"] = max(entry["y2"], data["top"][i] + data["height"][i])
+
+        results = []
+        for entry in lines.values():
+            text_line = " ".join(entry["words"]).strip()
+            if not text_line:
+                continue
+
+            results.append(
+                {
+                    "text": text_line,
+                    "x": entry["x1"] + offset_x,
+                    "y": entry["y1"] + offset_y,
+                    "w": entry["x2"] - entry["x1"],
+                    "h": entry["y2"] - entry["y1"],
+                }
+            )
+
+        return results
+
+    def _render_screen_mode_overlays(self, overlays):
+        """Render translated overlays (transparent background) near each line."""
+        self._destroy_screen_overlay_windows()
+        if not overlays:
+            return
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        accent_color = "#C8922B"  # gold tone
+        outline_color = "#4a2c0c"  # dark wood-like
+        font_spec = ("Leelawadee UI", 12, "bold")
+        for entry in overlays:
+            width = max(80, entry["w"])
+            height = 32
+            x = max(0, min(entry["x"], screen_w - width))
+            y = max(0, min(entry["y"], screen_h - height))
+
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.config(bg=TRANSPARENT_COLOR, highlightthickness=0)
+            try:
+                win.attributes("-transparentcolor", TRANSPARENT_COLOR)
+            except tk.TclError:
+                pass
+
+            win.geometry(f"{width}x{height}+{x}+{y}")
+            canvas = tk.Canvas(
+                win,
+                bg=TRANSPARENT_COLOR,
+                highlightthickness=0,
+                width=width,
+                height=height,
+            )
+            canvas.pack(fill=tk.BOTH, expand=True)
+
+            text_x = 5
+            text_y = 4
+            wrap_px = width - 10
+
+            outline_offsets = [
+                (-1, 0),
+                (1, 0),
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (1, -1),
+                (-1, 1),
+                (1, 1),
+            ]
+
+            for dx, dy in outline_offsets:
+                canvas.create_text(
+                    text_x + dx,
+                    text_y + dy,
+                    text=entry["text"],
+                    anchor="nw",
+                    fill=outline_color,
+                    font=font_spec,
+                    width=wrap_px,
+                )
+
+            canvas.create_text(
+                text_x,
+                text_y,
+                text=entry["text"],
+                anchor="nw",
+                fill=accent_color,
+                font=font_spec,
+                width=wrap_px,
+            )
+            self.screen_overlay_windows.append(win)
+
+    def _destroy_screen_overlay_windows(self):
+        """Destroy all temporary overlays used by screen translation mode."""
+        while self.screen_overlay_windows:
+            win = self.screen_overlay_windows.pop()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    # ------------------------------------------------------------------
     # Watch-mode helpers
     # ------------------------------------------------------------------
     def _looks_like_english(self, text: str, threshold: float = 0.3) -> bool:
@@ -711,6 +984,7 @@ class OcrTranslatorApp:
     def _on_close(self):
         """Cleanly stop watch thread and close window."""
         self._stop_watch()
+        self._stop_screen_mode()
         self.root.destroy()
 
     def run(self):
