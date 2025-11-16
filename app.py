@@ -84,6 +84,9 @@ class OcrTranslatorApp:
         self.overlay_window = None
         self.overlay_label = None
 
+        # ---- Layout helpers ----
+        self.center_paned = None
+
         # ---- Saved position state ----
         self.saved_watch_bbox = None
         self.saved_overlay_bbox = None
@@ -99,7 +102,7 @@ class OcrTranslatorApp:
     # UI
     # ------------------------------------------------------------------
     def _build_ui(self):
-        """Create UI: top and bottom text boxes share window 50/50."""
+        """Create UI: left (OCR) and right (translation) text boxes with adjustable splitter."""
         hotkey_label = tk.Label(
             self.root,
             text="Hotkeys: Ctrl+Shift+Q = แปลครั้งเดียว | Ctrl+Shift+W = เฝ้าพื้นที่ | Ctrl+Shift+E = หยุดเฝ้า",
@@ -131,39 +134,56 @@ class OcrTranslatorApp:
         )
         self.saved_status_label.pack(side=tk.LEFT)
 
-        # central frame that will be split into two rows (top/bottom)
-        center_frame = tk.Frame(self.root, bg="#f5f5f5")
-        center_frame.pack(fill=tk.BOTH, expand=True)
+        # Paned window for adjustable split (left/right)
+        self.center_paned = tk.PanedWindow(
+            self.root,
+            orient=tk.HORIZONTAL,
+            sashwidth=6,
+            sashrelief=tk.RAISED,
+            bg="#f5f5f5",
+            bd=0,
+        )
+        self.center_paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        center_frame.rowconfigure(0, weight=1)
-        center_frame.rowconfigure(1, weight=1)
-        center_frame.columnconfigure(0, weight=1)
-
-        # -------- Top (OCR) --------
-        top_frame = tk.Frame(center_frame, bg="#f5f5f5")
-        top_frame.grid(row=0, column=0, sticky="nsew")
-
-        top_label = tk.Label(top_frame, text="Original (OCR EN)", bg="#f5f5f5")
-        top_label.pack(anchor="w", padx=10)
+        # -------- Left (OCR) --------
+        left_frame = tk.Frame(self.center_paned, bg="#f5f5f5")
+        top_label = tk.Label(left_frame, text="Original (OCR EN)", bg="#f5f5f5")
+        top_label.pack(anchor="w", padx=5, pady=(5, 0))
 
         self.text_original = scrolledtext.ScrolledText(
-            top_frame,
+            left_frame,
             wrap=tk.WORD,   # auto wrap lines
         )
-        self.text_original.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 5))
+        self.text_original.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
 
-        # -------- Bottom (Translation) --------
-        bottom_frame = tk.Frame(center_frame, bg="#f5f5f5")
-        bottom_frame.grid(row=1, column=0, sticky="nsew")
-
-        bottom_label = tk.Label(bottom_frame, text="Translation (TH)", bg="#f5f5f5")
-        bottom_label.pack(anchor="w", padx=10)
+        # -------- Right (Translation) --------
+        right_frame = tk.Frame(self.center_paned, bg="#f5f5f5")
+        bottom_label = tk.Label(right_frame, text="Translation (TH)", bg="#f5f5f5")
+        bottom_label.pack(anchor="w", padx=5, pady=(5, 0))
 
         self.text_translation = scrolledtext.ScrolledText(
-            bottom_frame,
+            right_frame,
             wrap=tk.WORD,
         )
-        self.text_translation.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.text_translation.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+        self.center_paned.add(left_frame, minsize=200)
+        self.center_paned.add(right_frame, minsize=200)
+        self.root.after(150, self._set_initial_split)
+
+    def _set_initial_split(self, ratio: float = 0.5):
+        """Place the paned-window sash so both panes start 50:50."""
+        if self.center_paned is None:
+            return
+
+        total_width = self.center_paned.winfo_width()
+        if total_width <= 1:
+            # window not rendered yet, retry shortly
+            self.root.after(150, lambda: self._set_initial_split(ratio))
+            return
+
+        sash_x = int(total_width * ratio)
+        self.center_paned.sash_place(0, sash_x, 0)
 
     # ------------------------------------------------------------------
     # Hotkeys
