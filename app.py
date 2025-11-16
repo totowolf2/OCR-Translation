@@ -1,9 +1,11 @@
 import json
 import logging
+import queue
 import threading
 import tkinter as tk
+from difflib import SequenceMatcher
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from tkinter import messagebox, scrolledtext
 
 from PIL import ImageGrab
@@ -101,6 +103,11 @@ class OcrTranslatorApp:
         self.screen_mode_stop_event = threading.Event()
         self.screen_overlay_windows = []
         self.screen_last_entries = {}
+        self.screen_ocr_queue = queue.Queue(maxsize=2)
+        self.screen_translation_queue = queue.Queue(maxsize=2)
+        self.screen_ocr_thread = None
+        self.screen_translation_thread = None
+        self.screen_cache_ttl = 2.0
 
         # ---- Saved position state ----
         self.saved_watch_bbox = None
@@ -347,6 +354,7 @@ class OcrTranslatorApp:
         self._update_original_text("")
         self._reset_translation_history()
         self.screen_last_entries = {}
+        self._clear_screen_queues()
         self.after_selection_action = self._start_screen_mode_after_selection
         self._update_translation_text("เลือกหน้าจอหรือพื้นที่ที่ต้องการแปลทั้งจอ")
         self._start_region_selection()
@@ -369,10 +377,22 @@ class OcrTranslatorApp:
         self.screen_mode_stop_event = threading.Event()
         self.screen_mode_active = True
         self.screen_mode_thread = threading.Thread(
-            target=self._screen_mode_loop,
+            target=self._screen_capture_loop,
             daemon=True,
         )
         self.screen_mode_thread.start()
+
+        self.screen_ocr_thread = threading.Thread(
+            target=self._screen_ocr_loop,
+            daemon=True,
+        )
+        self.screen_ocr_thread.start()
+
+        self.screen_translation_thread = threading.Thread(
+            target=self._screen_translation_loop,
+            daemon=True,
+        )
+        self.screen_translation_thread.start()
 
     def _on_hotkey_stop_watch(self):
         """Stop watch mode."""
@@ -601,26 +621,69 @@ class OcrTranslatorApp:
         if clear_bbox:
             self.screen_mode_bbox = None
         self.screen_last_entries = {}
+        self._clear_screen_queues()
         self.root.after(0, self._destroy_screen_overlay_windows)
 
-    def _screen_mode_loop(self):
-        """Continuously scan the selected screen area and overlay translations."""
+    def _screen_capture_loop(self):
+        """Continuously grab screenshots and feed OCR queue."""
         if self.screen_mode_bbox is None:
             return
 
         bbox = self.screen_mode_bbox
-        translator = GoogleTranslator(source="en", target="th")
-        interval_sec = 2.0
+        interval_sec = 1.2
+        logger.info("Screen capture loop started.")
 
-        logger.info("Screen translation loop started.")
         while not self.screen_mode_stop_event.is_set():
             try:
+                self._schedule_screen_overlay_visibility(False, wait=True)
                 image = ImageGrab.grab(bbox=bbox)
+                self._schedule_screen_overlay_visibility(True, wait=False)
+                try:
+                    self.screen_ocr_queue.put_nowait((bbox, image))
+                except queue.Full:
+                    pass
+            except Exception as exc:
+                logger.exception("Screen capture error: %s", exc)
+
+            self.screen_mode_stop_event.wait(interval_sec)
+
+        logger.info("Screen capture loop stopped.")
+
+    def _screen_ocr_loop(self):
+        """Convert screenshots to OCR line data."""
+        logger.info("Screen OCR loop started.")
+        while not self.screen_mode_stop_event.is_set():
+            try:
+                bbox, image = self.screen_ocr_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
                 data = pytesseract.image_to_data(
                     image, lang="eng", output_type=Output.DICT
                 )
                 lines = self._collect_screen_lines(data, bbox[0], bbox[1])
+                try:
+                    self.screen_translation_queue.put_nowait(lines)
+                except queue.Full:
+                    pass
+            except Exception as exc:
+                logger.exception("Screen OCR error: %s", exc)
 
+        logger.info("Screen OCR loop stopped.")
+
+    def _screen_translation_loop(self):
+        """Translate OCR lines and update overlays."""
+        translator = GoogleTranslator(source="en", target="th")
+        logger.info("Screen translation loop started.")
+
+        while not self.screen_mode_stop_event.is_set():
+            try:
+                lines = self.screen_translation_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
                 overlays = []
                 new_cache = {}
                 for entry in lines:
@@ -628,47 +691,128 @@ class OcrTranslatorApp:
                     if not text_en or not self._looks_like_english(text_en):
                         continue
 
-                    key = (
-                        round(entry["x"]),
-                        round(entry["y"]),
-                        round(entry["w"]),
-                        round(entry["h"]),
-                    )
-                    cached = self.screen_last_entries.get(key)
-                    if cached and cached["text_en"] == text_en:
-                        text_th = cached["text_th"]
-                        new_cache[key] = cached
-                    else:
-                        text_th = translator.translate(text_en).strip()
-                        if text_th:
-                            new_cache[key] = {
-                                "text_en": text_en,
-                                "text_th": text_th,
-                            }
+                    center_x = entry["x"] + entry["w"] / 2
+                    center_y = entry["y"] + entry["h"] / 2
+                    cached = self._match_cached_entry(text_en, center_x, center_y)
 
+                    if cached:
+                        cached["timestamp"] = time()
+                        cached["x"] = self._blend_value(cached["x"], entry["x"])
+                        cached["y"] = self._blend_value(cached["y"], entry["y"])
+                        cached["w"] = self._blend_value(cached["w"], entry["w"])
+                        cached["h"] = self._blend_value(cached["h"], entry["h"])
+                        cached["center_x"] = self._blend_value(
+                            cached.get("center_x"), center_x
+                        )
+                        cached["center_y"] = self._blend_value(
+                            cached.get("center_y"), center_y
+                        )
+                        cache_key = cached.get("cache_key") or self._make_cache_key(
+                            cached.get("text_en", ""), center_x, center_y
+                        )
+                        cached["cache_key"] = cache_key
+                        new_cache[cache_key] = cached
+                        continue
+
+                    text_th = translator.translate(text_en).strip()
                     if not text_th:
                         continue
 
-                    overlays.append(
-                        {
-                            "text": text_th,
-                            "x": entry["x"],
-                            "y": entry["y"] + entry["h"] + 2,
-                            "w": entry["w"],
-                        }
-                    )
+                    key = self._make_cache_key(text_en, center_x, center_y)
+                    new_cache[key] = {
+                        "cache_key": key,
+                        "text_en": text_en,
+                        "text_th": text_th,
+                        "x": entry["x"],
+                        "y": entry["y"],
+                        "w": entry["w"],
+                        "h": entry["h"],
+                        "center_x": center_x,
+                        "center_y": center_y,
+                        "timestamp": time(),
+                    }
 
-                self.screen_last_entries = new_cache
+                now_ts = time()
+                ttl = self.screen_cache_ttl
+                merged_cache = {k: v for k, v in new_cache.items()}
+                for k, v in self.screen_last_entries.items():
+                    if k in merged_cache:
+                        continue
+                    if (now_ts - v.get("timestamp", now_ts)) < ttl:
+                        v.setdefault("cache_key", k)
+                        merged_cache[k] = v
+
+                self.screen_last_entries = merged_cache
+                overlays = [
+                    {
+                        "text": entry["text_th"],
+                        "x": entry["x"],
+                        "y": entry["y"] + entry["h"] + 2,
+                        "w": entry["w"],
+                    }
+                    for entry in self.screen_last_entries.values()
+                ]
 
                 self.root.after(0, self._render_screen_mode_overlays, overlays)
 
             except Exception as exc:
-                logger.exception("Screen mode error: %s", exc)
-
-            self.screen_mode_stop_event.wait(interval_sec)
+                logger.exception("Screen translation error: %s", exc)
 
         self.root.after(0, self._destroy_screen_overlay_windows)
         logger.info("Screen translation loop stopped.")
+
+    def _clear_screen_queues(self):
+        """Empty OCR/translation queues."""
+        while not self.screen_ocr_queue.empty():
+            try:
+                self.screen_ocr_queue.get_nowait()
+            except queue.Empty:
+                break
+        while not self.screen_translation_queue.empty():
+            try:
+                self.screen_translation_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _make_cache_key(self, text_en: str, center_x: float, center_y: float):
+        """Generate a coarse cache key combining location and text fingerprint."""
+        return (
+            int(center_x // 20),
+            int(center_y // 20),
+            hash(text_en) & 0xFFFF,
+        )
+
+    def _match_cached_entry(
+        self,
+        text_en: str,
+        center_x: float,
+        center_y: float,
+        max_dist: float = 40.0,
+        min_ratio: float = 0.7,
+    ):
+        """Return cached entry that closely matches position and text."""
+        best = None
+        best_ratio = 0.0
+        for entry in self.screen_last_entries.values():
+            cx = entry.get("center_x", entry.get("x", 0))
+            cy = entry.get("center_y", entry.get("y", 0))
+            if abs(cx - center_x) > max_dist or abs(cy - center_y) > max_dist:
+                continue
+
+            ratio = SequenceMatcher(
+                None, entry.get("text_en", ""), text_en
+            ).ratio()
+            if ratio >= min_ratio and ratio > best_ratio:
+                best = entry
+                best_ratio = ratio
+        return best
+
+    @staticmethod
+    def _blend_value(old: float, new: float, alpha: float = 0.3) -> float:
+        """Smoothed value to prevent overlay jitter."""
+        if old is None:
+            return new
+        return (old * (1 - alpha)) + (new * alpha)
 
     def _collect_screen_lines(self, data, offset_x, offset_y):
         """Group OCR words into full lines for translation."""
@@ -734,10 +878,10 @@ class OcrTranslatorApp:
         outline_color = "#4a2c0c"  # dark wood-like
         font_spec = ("Leelawadee UI", 12, "bold")
         for entry in overlays:
-            width = max(80, entry["w"])
+            width = max(80, int(entry["w"]))
             height = 32
-            x = max(0, min(entry["x"], screen_w - width))
-            y = max(0, min(entry["y"], screen_h - height))
+            x = max(0, min(int(entry["x"]), screen_w - width))
+            y = max(0, min(int(entry["y"]), screen_h - height))
 
             win = tk.Toplevel(self.root)
             win.overrideredirect(True)
@@ -803,6 +947,32 @@ class OcrTranslatorApp:
                 win.destroy()
             except tk.TclError:
                 pass
+
+    def _set_screen_overlay_visibility(self, visible: bool):
+        """Show or hide all screen translation overlays."""
+        for win in list(self.screen_overlay_windows):
+            try:
+                if visible:
+                    win.deiconify()
+                    win.lift()
+                    win.attributes("-topmost", True)
+                else:
+                    win.withdraw()
+            except tk.TclError:
+                pass
+
+    def _schedule_screen_overlay_visibility(self, visible: bool, wait: bool = True):
+        """Schedule overlay visibility change on the Tk thread."""
+        event = threading.Event()
+
+        def apply_visibility():
+            self._set_screen_overlay_visibility(visible)
+            event.set()
+
+        self.root.after(0, apply_visibility)
+        if wait:
+            event.wait()
+        return event
 
     # ------------------------------------------------------------------
     # Watch-mode helpers
