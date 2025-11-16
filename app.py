@@ -3,6 +3,7 @@ import logging
 import threading
 import tkinter as tk
 from pathlib import Path
+from time import monotonic
 from tkinter import messagebox, scrolledtext
 
 from PIL import ImageGrab
@@ -86,6 +87,11 @@ class OcrTranslatorApp:
 
         # ---- Layout helpers ----
         self.center_paned = None
+
+        # ---- Mode flags ----
+        self.watch_mode_active = False
+        self.history_reset_interval = 60.0  # seconds of inactivity before clearing history
+        self.last_history_timestamp = None
 
         # ---- Saved position state ----
         self.saved_watch_bbox = None
@@ -267,7 +273,7 @@ class OcrTranslatorApp:
         self.overlay_bbox = tuple(self.saved_overlay_bbox)
         self._create_overlay_window()
         self._update_overlay_text("รอข้อความจาก watch ...")
-        self._update_translation_text("กำลังใช้ตำแหน่งที่บันทึก")
+        self._reset_translation_history()
         self._start_watch_after_selection(self.watch_bbox)
 
     def _on_hotkey_single(self):
@@ -286,6 +292,7 @@ class OcrTranslatorApp:
         self._stop_watch()
         self.watch_bbox = None
         self.overlay_bbox = None
+        self._reset_translation_history()
         self.after_selection_action = self._on_watch_area_selected
         self._update_translation_text("ลากเพื่อเลือกพื้นที่ที่ต้องการให้ OCR เฝ้าดู")
         self._start_region_selection()
@@ -484,12 +491,45 @@ class OcrTranslatorApp:
         self.text_original.delete("1.0", tk.END)
         self.text_original.insert(tk.END, text_en)
 
-    def _update_translation_text(self, text_th: str):
-        """Update bottom text box and adjust font size."""
+    def _reset_translation_history(self):
+        """Clear translation panel (used before starting a new watch history)."""
+        if self.text_translation is not None:
+            self.text_translation.delete("1.0", tk.END)
+        self.last_history_timestamp = None
+
+    def _update_translation_text(self, text_th: str, append: bool = False):
+        """Update translation panel with optional history append behaviour."""
         font_size = self._auto_font_size(text_th, min_size=12, max_size=24)
         self.text_translation.config(font=("Arial", font_size))
-        self.text_translation.delete("1.0", tk.END)
-        self.text_translation.insert(tk.END, text_th)
+
+        if append:
+            clean = text_th.strip()
+            if not clean:
+                return
+            if self.text_translation.index("end-1c") != "1.0":
+                self.text_translation.insert(tk.END, "\n\n")
+            self.text_translation.insert(tk.END, clean)
+        else:
+            self.text_translation.delete("1.0", tk.END)
+            self.text_translation.insert(tk.END, text_th)
+
+        self.text_translation.see(tk.END)
+
+    def _append_watch_history(self, text_th: str):
+        """Append the latest watch translation and auto-scroll."""
+        if not self.watch_mode_active:
+            self._update_translation_text(text_th)
+            return
+
+        now = monotonic()
+        if (
+            self.last_history_timestamp is not None
+            and (now - self.last_history_timestamp) >= self.history_reset_interval
+        ):
+            self._reset_translation_history()
+
+        self._update_translation_text(text_th, append=True)
+        self.last_history_timestamp = now
 
     # ------------------------------------------------------------------
     # Watch-mode helpers
@@ -511,6 +551,8 @@ class OcrTranslatorApp:
         """Start watching the selected region."""
         logger.info("Starting watch mode for bbox: %s", bbox)
 
+        self._reset_translation_history()
+        self.watch_mode_active = True
         self.watch_bbox = bbox
         self.last_watch_text = ""
         self.watch_stop_event = threading.Event()
@@ -528,6 +570,8 @@ class OcrTranslatorApp:
             self.watch_stop_event.set()
             self.watch_thread = None
             self.last_watch_text = ""
+            self.watch_mode_active = False
+            self.last_history_timestamp = None
 
         if destroy_overlay:
             self._destroy_overlay_window()
@@ -560,7 +604,7 @@ class OcrTranslatorApp:
 
                     translator = GoogleTranslator(source="en", target="th")
                     text_th = translator.translate(text_en).strip()
-                    self.root.after(0, self._update_translation_text, text_th)
+                    self.root.after(0, self._append_watch_history, text_th)
                     self.root.after(0, self._update_overlay_text, text_th)
 
             except Exception as e:
