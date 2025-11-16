@@ -103,8 +103,8 @@ class OcrTranslatorApp:
         self.screen_mode_stop_event = threading.Event()
         self.screen_overlay_windows = []
         self.screen_last_entries = {}
-        self.screen_ocr_queue = queue.Queue(maxsize=2)
-        self.screen_translation_queue = queue.Queue(maxsize=2)
+        self.screen_ocr_queue = queue.Queue(maxsize=4)
+        self.screen_translation_queue = queue.Queue(maxsize=4)
         self.screen_ocr_thread = None
         self.screen_translation_thread = None
         self.screen_cache_ttl = 2.0
@@ -630,7 +630,7 @@ class OcrTranslatorApp:
             return
 
         bbox = self.screen_mode_bbox
-        interval_sec = 1.2
+        interval_sec = 0.3
         logger.info("Screen capture loop started.")
 
         while not self.screen_mode_stop_event.is_set():
@@ -737,6 +737,14 @@ class OcrTranslatorApp:
                 merged_cache = {k: v for k, v in new_cache.items()}
                 for k, v in self.screen_last_entries.items():
                     if k in merged_cache:
+                        continue
+                    cy_old = v.get("center_y", v.get("y", 0))
+                    conflict = False
+                    for new_entry in new_cache.values():
+                        if abs(new_entry["center_y"] - cy_old) < 45:
+                            conflict = True
+                            break
+                    if conflict:
                         continue
                     if (now_ts - v.get("timestamp", now_ts)) < ttl:
                         v.setdefault("cache_key", k)
