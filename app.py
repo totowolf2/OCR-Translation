@@ -1,8 +1,11 @@
+import ctypes
 import json
 import logging
 import queue
+import sys
 import threading
 import tkinter as tk
+from ctypes import wintypes
 from difflib import SequenceMatcher
 from pathlib import Path
 from time import monotonic, time
@@ -29,6 +32,7 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 APP_DIR = Path(__file__).resolve().parent
 POSITIONS_PATH = APP_DIR / "watch_positions.json"
 TRANSPARENT_COLOR = "#1f1407"
+WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
 class OcrTranslatorApp:
@@ -108,6 +112,8 @@ class OcrTranslatorApp:
         self.screen_ocr_thread = None
         self.screen_translation_thread = None
         self.screen_cache_ttl = 2.0
+        self._user32 = None
+        self._capture_exclusion_available = self._init_capture_exclusion()
 
         # ---- Saved position state ----
         self.saved_watch_bbox = None
@@ -635,9 +641,12 @@ class OcrTranslatorApp:
 
         while not self.screen_mode_stop_event.is_set():
             try:
-                self._schedule_screen_overlay_visibility(False, wait=True)
+                hide_overlays = not self._capture_exclusion_available
+                if hide_overlays:
+                    self._schedule_screen_overlay_visibility(False, wait=True)
                 image = ImageGrab.grab(bbox=bbox)
-                self._schedule_screen_overlay_visibility(True, wait=False)
+                if hide_overlays:
+                    self._schedule_screen_overlay_visibility(True, wait=False)
                 try:
                     self.screen_ocr_queue.put_nowait((bbox, image))
                 except queue.Full:
@@ -901,6 +910,8 @@ class OcrTranslatorApp:
                 pass
 
             win.geometry(f"{width}x{height}+{x}+{y}")
+            win.update_idletasks()
+            self._exclude_overlay_from_capture(win)
             canvas = tk.Canvas(
                 win,
                 bg=TRANSPARENT_COLOR,
@@ -982,6 +993,36 @@ class OcrTranslatorApp:
             event.wait()
         return event
 
+    def _init_capture_exclusion(self) -> bool:
+        """Detect whether we can mark overlay windows to be ignored by screen capture."""
+        if sys.platform != "win32":
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            if not hasattr(user32, "SetWindowDisplayAffinity"):
+                return False
+            user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+            user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+            self._user32 = user32
+            return True
+        except Exception as exc:
+            logger.debug("Capture exclusion init failed: %s", exc)
+            self._user32 = None
+            return False
+
+    def _exclude_overlay_from_capture(self, window: tk.Toplevel):
+        """Mark overlay window so Windows screen capture APIs ignore it."""
+        if not self._capture_exclusion_available or not self._user32:
+            return
+        try:
+            hwnd = wintypes.HWND(window.winfo_id())
+            result = self._user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+            if result == 0:
+                raise ctypes.WinError()
+        except Exception as exc:
+            logger.debug("Failed to exclude overlay from capture: %s", exc)
+            self._capture_exclusion_available = False
+            self._user32 = None
     # ------------------------------------------------------------------
     # Watch-mode helpers
     # ------------------------------------------------------------------
